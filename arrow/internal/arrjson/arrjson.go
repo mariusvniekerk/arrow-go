@@ -759,12 +759,12 @@ func fieldsToJSON(fields []arrow.Field, parentPos dictutils.FieldPos, mapper *di
 func fieldsFromJSON(fields []FieldWrapper) []arrow.Field {
 	vs := make([]arrow.Field, len(fields))
 	for i, v := range fields {
-		vs[i] = fieldFromJSON(v.Field)
+		vs[i] = FieldFromJSON(v.Field)
 	}
 	return vs
 }
 
-func fieldFromJSON(f Field) arrow.Field {
+func FieldFromJSON(f Field) arrow.Field {
 	return arrow.Field{
 		Name:     f.Name,
 		Type:     f.arrowType,

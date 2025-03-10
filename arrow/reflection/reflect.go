@@ -17,15 +17,25 @@
 package reflection
 
 import (
-	"fmt"
+	"math/big"
 	"reflect"
+	"runtime/debug"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/decimal"
 	"github.com/apache/arrow-go/v18/arrow/internal/tagparser"
 	"github.com/apache/arrow-go/v18/internal/utils"
-	"github.com/apache/arrow-go/v18/parquet"
+)
+
+type nullable int
+
+const (
+	nullableUnknown nullable = iota
+	nullableFalse
+	nullableTrue
 )
 
 type taggedInfo struct {
@@ -39,25 +49,18 @@ type taggedInfo struct {
 	KeyLength   int32
 	ValueLength int32
 
-	Scale      int32
-	KeyScale   int32
-	ValueScale int32
+	Scale      *int32
+	KeyScale   *int32
+	ValueScale *int32
 
-	Precision      int32
-	KeyPrecision   int32
-	ValuePrecision int32
+	Precision      *int32
+	KeyPrecision   *int32
+	ValuePrecision *int32
 
-	FieldID      int32
-	KeyFieldID   int32
-	ValueFieldID int32
+	Nullable nullable
 
-	Nullable bool
-	// RepetitionType  parquet.Repetition
-	// ValueRepetition parquet.Repetition
-
-	// LogicalFields      map[string]string
-	// KeyLogicalFields   map[string]string
-	// ValueLogicalFields map[string]string
+	Unit     *arrow.TimeUnit
+	TimeZone string
 
 	Exclude bool
 }
@@ -75,10 +78,6 @@ func (t *taggedInfo) CopyForKey() (ret taggedInfo) {
 	ret.Length = t.KeyLength
 	ret.Scale = t.KeyScale
 	ret.Precision = t.KeyPrecision
-	ret.FieldID = t.KeyFieldID
-	// ret.RepetitionType = parquet.Repetitions.Required
-	// ret.Converted = t.KeyConverted
-	// ret.LogicalType = t.KeyLogicalType
 	return
 }
 
@@ -96,106 +95,81 @@ func (t *taggedInfo) CopyForValue() (ret taggedInfo) {
 	ret.Length = t.ValueLength
 	ret.Scale = t.ValueScale
 	ret.Precision = t.ValuePrecision
-	ret.FieldID = t.ValueFieldID
-	// ret.RepetitionType = t.ValueRepetition
-	// ret.Converted = t.ValueConverted
-	// ret.LogicalType = t.ValueLogicalType
+	ret.Unit = t.Unit
+	ret.TimeZone = t.TimeZone
 	return
 }
 
-// func (t *taggedInfo) UpdateLogicalTypes() {
-// 	processLogicalType := func(fields map[string]string, precision, scale int32) LogicalType {
-// 		t, ok := fields["type"]
-// 		if !ok {
-// 			return NoLogicalType{}
-// 		}
+func (t *taggedInfo) UpdateTypeParams(tp arrow.DataType) arrow.DataType {
+	if tp == nil {
+		return nil
+	}
+	if tp.ID() == arrow.DECIMAL {
+		switch t.Type.(type) {
+		case *arrow.Decimal32Type:
+			return &arrow.Decimal32Type{Precision: *t.Precision, Scale: *t.Scale}
+		case *arrow.Decimal64Type:
+			return &arrow.Decimal64Type{Precision: *t.Precision, Scale: *t.Scale}
+		case *arrow.Decimal128Type:
+			return &arrow.Decimal128Type{Precision: *t.Precision, Scale: *t.Scale}
+		case *arrow.Decimal256Type:
+			return &arrow.Decimal256Type{Precision: *t.Precision, Scale: *t.Scale}
+		}
+	} else if tp.ID() == arrow.TIMESTAMP {
+		tztp := tp.(*arrow.TimestampType)
+		newType := &arrow.TimestampType{Unit: tztp.Unit, TimeZone: tztp.TimeZone}
+		if t.Unit != nil {
+			newType.Unit = *t.Unit
+		}
+		if t.TimeZone != "" {
+			newType.TimeZone = t.TimeZone
+		}
+		return newType
+	} else if tp.ID() == arrow.DURATION {
+		if t.Unit != nil {
+			return &arrow.DurationType{Unit: *t.Unit}
+		}
 
-// 		switch strings.ToLower(t) {
-// 		case "string":
-// 			return StringLogicalType{}
-// 		case "map":
-// 			return MapLogicalType{}
-// 		case "list":
-// 			return ListLogicalType{}
-// 		case "enum":
-// 			return EnumLogicalType{}
-// 		case "decimal":
-// 			if v, ok := fields["precision"]; ok {
-// 				precision = int32FromType(v)
-// 			}
-// 			if v, ok := fields["scale"]; ok {
-// 				scale = int32FromType(v)
-// 			}
-// 			return NewDecimalLogicalType(precision, scale)
-// 		case "date":
-// 			return DateLogicalType{}
-// 		case "time":
-// 			unit, ok := fields["unit"]
-// 			if !ok {
-// 				panic("must specify unit for time logical type")
-// 			}
-// 			adjustedToUtc, ok := fields["isadjustedutc"]
-// 			if !ok {
-// 				adjustedToUtc = "true"
-// 			}
-// 			return NewTimeLogicalType(boolFromStr(adjustedToUtc), timeUnitFromString(strings.ToLower(unit)))
-// 		case "timestamp":
-// 			unit, ok := fields["unit"]
-// 			if !ok {
-// 				panic("must specify unit for time logical type")
-// 			}
-// 			adjustedToUtc, ok := fields["isadjustedutc"]
-// 			if !ok {
-// 				adjustedToUtc = "true"
-// 			}
-// 			return NewTimestampLogicalType(boolFromStr(adjustedToUtc), timeUnitFromString(unit))
-// 		case "integer":
-// 			width, ok := fields["bitwidth"]
-// 			if !ok {
-// 				panic("must specify bitwidth if explicitly setting integer logical type")
-// 			}
-// 			signed, ok := fields["signed"]
-// 			if !ok {
-// 				signed = "true"
-// 			}
+	}
+	if tp.ID() == arrow.MAP {
+		ktp := tp.(*arrow.MapType).KeyType()
+		if ktp != nil {
+			kti := t.CopyForKey()
+			ktp = kti.UpdateTypeParams(ktp)
+		}
+		vtp := tp.(*arrow.MapType).ItemType()
+		if vtp != nil {
+			vti := t.CopyForValue()
+			vtp = vti.UpdateTypeParams(vtp)
+		}
+		return arrow.MapOf(ktp, vtp)
+	}
+	if tp.ID() == arrow.LIST {
+		etp := tp.(*arrow.ListType).Elem()
+		if etp != nil {
+			eti := t.CopyForValue()
+			etp = eti.UpdateTypeParams(etp)
+		}
+		return arrow.ListOf(etp)
+	}
+	if tp.ID() == arrow.FIXED_SIZE_LIST {
+		etp := tp.(*arrow.FixedSizeListType).Elem()
+		if etp != nil {
+			eti := t.CopyForValue()
+			etp = eti.UpdateTypeParams(etp)
+		}
+		return arrow.FixedSizeListOf(t.Length, etp)
+	}
 
-// 			return NewIntLogicalType(int8(int32FromType(width)), boolFromStr(signed))
-// 		case "null":
-// 			return NullLogicalType{}
-// 		case "json":
-// 			return JSONLogicalType{}
-// 		case "bson":
-// 			return BSONLogicalType{}
-// 		case "uuid":
-// 			return UUIDLogicalType{}
-// 		case "float16":
-// 			return Float16LogicalType{}
-// 		default:
-// 			panic(fmt.Errorf("invalid logical type specified: %s", t))
-// 		}
-// 	}
-
-// 	t.LogicalType = processLogicalType(t.LogicalFields, t.Precision, t.Scale)
-// 	t.KeyLogicalType = processLogicalType(t.KeyLogicalFields, t.KeyPrecision, t.KeyScale)
-// 	t.ValueLogicalType = processLogicalType(t.ValueLogicalFields, t.ValuePrecision, t.ValueScale)
-// }
+	return tp
+}
 
 func newTaggedInfo() taggedInfo {
 	return taggedInfo{
-		Type: nil,
-		// RepetitionType:     parquet.Repetitions.Undefined,
-		// ValueRepetition:    parquet.Repetitions.Undefined,
-		// Converted:          ConvertedTypes.NA,
-		// KeyConverted:       ConvertedTypes.NA,
-		// ValueConverted:     ConvertedTypes.NA,
-		FieldID:      -1,
-		KeyFieldID:   -1,
-		ValueFieldID: -1,
-		// LogicalFields:      make(map[string]string),
-		// KeyLogicalFields:   make(map[string]string),
-		// ValueLogicalFields: make(map[string]string),
+		Type:     nil,
 		Exclude:  false,
-		Nullable: false,
+		Nullable: nullableUnknown,
+		TimeZone: "UTC",
 	}
 }
 
@@ -215,49 +189,7 @@ var boolFromStr = func(v string) bool {
 	return val
 }
 
-// extractJSONObject properly extracts a JSON object handling nested braces
-func extractJSONObject(s string, startIdx int) (string, int, error) {
-	if startIdx >= len(s) || s[startIdx] != '{' {
-		return "", startIdx, fmt.Errorf("expected '{' at position %d", startIdx)
-	}
-
-	depth := 1
-	endIdx := startIdx + 1
-
-	for endIdx < len(s) && depth > 0 {
-		switch s[endIdx] {
-		case '{':
-			depth++
-		case '}':
-			depth--
-		}
-		endIdx++
-	}
-
-	if depth != 0 {
-		return "", startIdx, fmt.Errorf("unbalanced braces in JSON")
-	}
-
-	return s[startIdx:endIdx], endIdx, nil
-}
-
 func infoFromTags(f reflect.StructTag) *taggedInfo {
-	// repFromStr := func(v string) parquet.Repetition {
-	// 	r, err := format.FieldRepetitionTypeFromString(strings.ToUpper(v))
-	// 	if err != nil {
-	// 		panic(err)
-	// 	}
-	// 	return parquet.Repetition(r)
-	// }
-
-	// convertedFromStr := func(v string) ConvertedType {
-	// 	c, err := format.ConvertedTypeFromString(strings.ToUpper(v))
-	// 	if err != nil {
-	// 		panic(err)
-	// 	}
-	// 	return ConvertedType(c)
-	// }
-
 	typFromStr := func(v string) arrow.DataType {
 		typStr := strings.ToLower(v)
 
@@ -304,6 +236,9 @@ func infoFromTags(f reflect.StructTag) *taggedInfo {
 			return t
 		}
 
+		if strings.HasPrefix(typStr, "timestamp") {
+			return &arrow.TimestampType{TimeZone: "UTC"}
+		}
 		// TODO datetime types
 		// TODO decimal types
 		return nil
@@ -343,36 +278,63 @@ func infoFromTags(f reflect.StructTag) *taggedInfo {
 		}
 
 		if precision, ok := tag.Option("precision"); ok {
-			info.Precision = int32FromType(precision)
+			precision := int32FromType(precision)
+			info.Precision = &precision
 		}
 		if precision, ok := tag.Option("keyprecision"); ok {
-			info.KeyPrecision = int32FromType(precision)
+			precision := int32FromType(precision)
+			info.KeyPrecision = &precision
 		}
 		if precision, ok := tag.Option("valueprecision"); ok {
-			info.ValuePrecision = int32FromType(precision)
+			precision := int32FromType(precision)
+			info.ValuePrecision = &precision
 		}
 
 		if scale, ok := tag.Option("scale"); ok {
-			info.Scale = int32FromType(scale)
+			scale := int32FromType(scale)
+			info.Scale = &scale
 		}
 		if scale, ok := tag.Option("keyscale"); ok {
-			info.KeyScale = int32FromType(scale)
+			scale := int32FromType(scale)
+			info.KeyScale = &scale
 		}
 		if scale, ok := tag.Option("valuescale"); ok {
-			info.ValueScale = int32FromType(scale)
+			scale := int32FromType(scale)
+			info.ValueScale = &scale
 		}
-		// info.UpdateLogicalTypes()
-
+		if unit, ok := tag.Option("unit"); ok {
+			switch strings.ToLower(unit) {
+			case "millisecond", "ms":
+				u := arrow.Millisecond
+				info.Unit = &u
+			case "microsecond", "us", "µs":
+				u := arrow.Microsecond
+				info.Unit = &u
+			case "nanosecond", "ns":
+				u := arrow.Nanosecond
+				info.Unit = &u
+			case "second", "s":
+				u := arrow.Second
+				info.Unit = &u
+			default:
+				panic("invalid unit: " + unit)
+			}
+		}
+		if timezone, ok := tag.Option("timezone"); ok {
+			info.TimeZone = timezone
+		}
 		if tag.HasOption("nullable") {
-			info.Nullable = true
+			info.Nullable = nullableTrue
 		}
 		if tag.HasOption("notnull") {
-			info.Nullable = false
+			info.Nullable = nullableFalse
 		}
 		if tag.HasOption("null") {
-			info.Nullable = true
+			info.Nullable = nullableTrue
 		}
 
+		// Ensure that additional tag params are merged into the arrow type where present
+		info.Type = info.UpdateTypeParams(info.Type)
 		return &info
 	}
 	return nil
@@ -383,29 +345,21 @@ type partialField struct {
 	nullable bool
 }
 
-// typeToNode recursively converts a physical type and the tag info into parquet Nodes
+// typeToPartialArrowField recursively converts a physical type and the tag info into parquet Nodes
 //
 // to avoid having to propagate errors up potentially high numbers of recursive calls
 // we use panics and then recover in the public function NewSchemaFromStruct so that a
 // failure very far down the stack quickly unwinds.
-func typeToNode(name string, typ reflect.Type, info *taggedInfo) *partialField {
+func typeToPartialArrowField(name string, typ reflect.Type, info *taggedInfo) *partialField {
 	// set up our default values for everything
 	var (
-		// converted = ConvertedTypes.None
-		// logical   LogicalType = NoLogicalType{}
-		// fieldID               = int32(-1)
-		physical  arrow.DataType = arrow.Null
+		arrowTp   arrow.DataType = nil
 		typeLen                  = 0
-		precision int32          = 0
-		scale     int32          = 0
+		precision *int32         = nil
+		scale     *int32         = nil
 	)
 	if info != nil { // we have struct tag info to process
-		// fieldID = info.FieldID
-		// if info.Converted != ConvertedTypes.NA {
-		// 	converted = info.Converted
-		// }
-		// logical = info.LogicalType
-		// physical = info.Type
+		arrowTp = info.Type
 		typeLen = int(info.Length)
 		precision = info.Precision
 		scale = info.Scale
@@ -413,154 +367,178 @@ func typeToNode(name string, typ reflect.Type, info *taggedInfo) *partialField {
 		if info.Name != "" {
 			name = info.Name
 		}
-		// if info.RepetitionType != parquet.Repetitions.Undefined {
-		// 	repType = info.RepetitionType
-		// }
 	}
 
 	// simplify the logic by switching based on the reflection Kind
 	switch typ.Kind() {
 	case reflect.Map:
-		// a map must have a logical type of MAP or have no tag for logical type in which case
-		// we assume MAP logical type.
-		// if !logical.IsNone() && !logical.Equals(MapLogicalType{}) {
-		// 	panic("cannot set logical type to something other than map for a map")
-		// }
-
 		infoCopy := newTaggedInfo()
 		if info != nil { // populate any value specific tags to propagate for the value type
 			infoCopy = info.CopyForValue()
 		}
-
 		// create the node for the value type of the map
-		value := typeToNode("value", typ.Elem(), &infoCopy)
+		value := typeToPartialArrowField("value", typ.Elem(), &infoCopy)
 		if info != nil { // change our copy to now use the key specific tags if they exist
 			infoCopy = info.CopyForKey()
 		}
-
 		// create the node for the key type of the map
-		key := typeToNode("key", typ.Key(), &infoCopy)
+		key := typeToPartialArrowField("key", typ.Key(), &infoCopy)
 		if key.nullable {
 			panic("key type of map must be non-nullable")
 		}
-		return &partialField{typ: arrow.MapOf(key.typ, value.typ)}
+		kf := arrow.Field{Name: "key", Type: key.typ, Nullable: false}
+		vf := arrow.Field{Name: "value", Type: value.typ, Nullable: value.nullable}
+		return &partialField{typ: arrow.MapOfFields(kf, vf)}
 	case reflect.Struct:
 		// Handle special decimal types
-		decimalTypeIFace := reflect.TypeOf((*arrow.DecimalType)(nil)).Elem()
-		if typ.Implements(decimalTypeIFace) {
-			var ptyp arrow.DataType
-			if typ == reflect.TypeOf(arrow.Decimal32Type{}) {
-				ptyp = &arrow.Decimal32Type{Precision: precision, Scale: scale}
-			} else if typ == reflect.TypeOf(arrow.Decimal64Type{}) {
-				ptyp = &arrow.Decimal64Type{Precision: precision, Scale: scale}
-			} else if typ == reflect.TypeOf(arrow.Decimal128Type{}) {
-				ptyp = &arrow.Decimal128Type{Precision: precision, Scale: scale}
-			} else if typ == reflect.TypeOf(arrow.Decimal256Type{}) {
-				ptyp = &arrow.Decimal256Type{Precision: precision, Scale: scale}
-			}
-
-			return &partialField{typ: ptyp}
+		if isDecimal, result := decimalToNode(typ, arrowTp, precision, scale); isDecimal {
+			return result
 		}
-		// TODO handle other special types like Interval, Duration, etc.
+		// Handle timestamp types
+		if typ == reflect.TypeOf(time.Time{}) {
+			if arrowTp == nil {
+				arrowTp = arrow.FixedWidthTypes.Timestamp_ns
+			}
+			if info != nil {
+				arrowTp = info.UpdateTypeParams(arrowTp)
+			}
+			return &partialField{typ: arrowTp}
+		}
+		if typ == reflect.TypeOf(time.Duration(0)) {
+			if arrowTp == nil {
+				arrowTp = arrow.FixedWidthTypes.Duration_ns
+			}
+			// Ensure that unit is set if they are present in the struct tags
+			if info != nil {
+				info.Type = arrowTp
+				info.UpdateTypeParams(arrowTp)
+				arrowTp = info.Type
+			}
+			return &partialField{typ: arrowTp}
+		}
+		if arrowTp != nil && arrowTp.ID() == arrow.DURATION {
+			// Add in the unit and timezone if they are set
+			finalTyp := arrow.TimestampType{}
+			if info != nil && info.Unit != nil {
+				finalTyp.Unit = *info.Unit
+			}
+			if info != nil && info.TimeZone != "" {
+				finalTyp.TimeZone = info.TimeZone
+			}
+			return &partialField{typ: &finalTyp}
+		}
+
+		// If we have a physical type specified, use that, this is generally used for
+		// things like intervals  and other time related types
+		if arrowTp != nil {
+			return &partialField{typ: arrowTp}
+		}
 
 		// structs are structs
 		fields := make([]arrow.Field, 0)
 		for i := 0; i < typ.NumField(); i++ {
 			f := typ.Field(i)
 			tags := infoFromTags(f.Tag)
-			name := f.Name
+			if tags != nil && tags.Exclude {
+				continue
+			}
+			fieldName := f.Name
 			if tags != nil && tags.Name != "" {
-				name = tags.Name
+				fieldName = tags.Name
 			}
-			if tags != nil && tags.Type != nil {
-				fields = append(fields, arrow.Field{Name: name, Type: tags.Type, Nullable: tags.Nullable})
-			} else if tags == nil || !tags.Exclude {
-				pf := typeToNode(f.Name, f.Type, tags)
-				fields = append(fields, arrow.Field{Name: f.Name, Type: pf.typ, Nullable: pf.nullable})
+			// if tags != nil && tags.Type != nil {
+			// fields = append(fields, arrow.Field{Name: name, Type: tags.Type, Nullable: tags.Nullable})
+			// } if tags == nil || !tags.Exclude {
+			pf := typeToPartialArrowField(fieldName, f.Type, tags)
+			nullable := pf.nullable
+			if tags != nil {
+				switch tags.Nullable {
+				case nullableTrue:
+					nullable = true
+				case nullableFalse:
+					nullable = false
+				}
 			}
+			fields = append(fields, arrow.Field{Name: fieldName, Type: pf.typ, Nullable: nullable})
 		}
 		return &partialField{typ: arrow.StructOf(fields...)}
 	case reflect.Ptr: // if we encounter a pointer create a node for the type it points to, but mark it as optional
-		f := typeToNode(name, typ.Elem(), info)
+		f := typeToPartialArrowField(name, typ.Elem(), info)
 		return &partialField{typ: f.typ, nullable: true}
 	case reflect.Array:
 		// arrays are repeated or fixed size
-		// if typ == reflect.TypeOf(parquet.Int96{}) {
-		// 	return NewInt96Node(name, repType, fieldID)
-		// }
-
+		if typeLen == 0 { // if there was no type length specified in the tag, use the length of the type.
+			typeLen = typ.Len()
+		}
 		if typ.Elem() == reflect.TypeOf(byte(0)) { // something like [12]byte translates to FixedLenByteArray with length 12
-			if physical == arrow.Null {
-				physical = &arrow.FixedSizeBinaryType{}
+			if arrowTp == nil {
+				arrowTp = &arrow.FixedSizeBinaryType{}
 			}
-			if typeLen == 0 { // if there was no type length specified in the tag, use the length of the type.
-				typeLen = typ.Len()
-			}
-			// TODO: FixedSizeListOf
-
 			return &partialField{typ: &arrow.FixedSizeBinaryType{ByteWidth: typeLen}}
 		}
-		elemTp := typeToNode(name, typ.Elem(), info)
-
-		return &partialField{typ: arrow.ListOf(elemTp.typ)}
+		elemTp := typeToPartialArrowField(name, typ.Elem(), info)
+		typeLen := int32(typeLen)
+		if elemTp.nullable {
+			return &partialField{typ: arrow.FixedSizeListOf(typeLen, elemTp.typ)}
+		} else {
+			return &partialField{typ: arrow.FixedSizeListOfNonNullable(typeLen, elemTp.typ)}
+		}
 	case reflect.Slice:
 		// for slices, we default to treating them as lists unless the repetition type is set to REPEATED or they are
 		// a bytearray/fixedlenbytearray
 		switch {
-		// case repType == parquet.Repetitions.Repeated:
-		// 	return typeToNode(name, typ.Elem(), parquet.Repetitions.Repeated, info)
-		// case physical == arrow.FixedSizeListOf()parquet.Types.FixedLenByteArray || physical == parquet.Types.ByteArray:
-		// 	if typ.Elem() != reflect.TypeOf(byte(0)) {
-		// 		panic("slice with physical type ByteArray or FixedLenByteArray must be []byte")
-		// 	}
-		// 	fallthrough
 		case typ.Elem() == reflect.TypeOf(byte(0)):
-			return &partialField{typ: &arrow.BinaryType{}}
+			if arrowTp == nil {
+				arrowTp = &arrow.BinaryType{}
+			}
+			return &partialField{typ: arrowTp}
 		default:
 			var elemInfo *taggedInfo
 			if info != nil {
 				elemInfo = &taggedInfo{}
 				*elemInfo = info.CopyForValue()
 			}
-
-			// if !logical.IsNone() && !logical.Equals(ListLogicalType{}) {
-			// 	panic("slice must either be repeated or a List type")
-			// }
-			// if converted != ConvertedTypes.None && converted != ConvertedTypes.List {
-			// 	panic("slice must either be repeated or a List type")
-			// }
-			et := typeToNode("element", typ.Elem(), elemInfo)
-			return &partialField{
-				typ: arrow.ListOf(et.typ),
+			elemTp := typeToPartialArrowField("element", typ.Elem(), elemInfo)
+			if elemTp.nullable {
+				return &partialField{typ: arrow.ListOf(elemTp.typ)}
+			} else {
+				return &partialField{typ: arrow.ListOfNonNullable(elemTp.typ)}
 			}
 		}
 
 	case reflect.String:
 		var ptyp arrow.DataType
 		ptyp = &arrow.StringType{}
-		if physical != arrow.Null {
-			ptyp = physical
+		if arrowTp != nil {
+			ptyp = arrowTp
 		}
 		// strings are byte arrays or fixedlen byte array
 		return &partialField{typ: ptyp}
 	case reflect.Int, reflect.Int32, reflect.Int8, reflect.Int16, reflect.Int64:
 		// handle integer types, default to setting the corresponding logical type
+
 		var ptyp arrow.DataType
-		switch typ.Bits() {
-		case 8:
-			ptyp = &arrow.Int8Type{}
-		case 16:
-			ptyp = &arrow.Int16Type{}
-		case 64:
-			ptyp = &arrow.Int64Type{}
-		default:
-			ptyp = &arrow.Int32Type{}
+		// Handle special known integer types
+		if typ == reflect.TypeOf(time.Duration(0)) {
+			ptyp = &arrow.DurationType{Unit: arrow.Nanosecond}
+		} else if typ == reflect.TypeOf(time.Time{}) {
+			ptyp = &arrow.TimestampType{Unit: arrow.Nanosecond}
+		} else {
+			switch typ.Bits() {
+			case 8:
+				ptyp = &arrow.Int8Type{}
+			case 16:
+				ptyp = &arrow.Int16Type{}
+			case 64:
+				ptyp = &arrow.Int64Type{}
+			default:
+				ptyp = &arrow.Int32Type{}
+			}
 		}
 
-		if physical != arrow.Null {
-			ptyp = physical
+		if arrowTp != nil {
+			ptyp = arrowTp
 		}
-
 		return &partialField{typ: ptyp}
 	case reflect.Uint, reflect.Uint32, reflect.Uint8, reflect.Uint16, reflect.Uint64:
 		// handle unsigned integer types and default to the corresponding logical type for it.
@@ -576,8 +554,8 @@ func typeToNode(name string, typ reflect.Type, info *taggedInfo) *partialField {
 			ptyp = &arrow.Uint32Type{}
 		}
 
-		if physical != arrow.Null {
-			ptyp = physical
+		if arrowTp != nil {
+			ptyp = arrowTp
 		}
 		return &partialField{typ: ptyp}
 	case reflect.Bool:
@@ -591,64 +569,85 @@ func typeToNode(name string, typ reflect.Type, info *taggedInfo) *partialField {
 			ptyp = &arrow.Float64Type{}
 		}
 
-		if physical != arrow.Null {
-			ptyp = physical
+		if arrowTp != nil {
+			ptyp = arrowTp
 		}
 		return &partialField{typ: ptyp}
 	}
 	return nil
 }
 
+func decimalToNode(typ reflect.Type, physical arrow.DataType, precision *int32, scale *int32) (bool, *partialField) {
+	if typ == reflect.TypeOf(decimal.Decimal32(0)) {
+		physical = &arrow.Decimal32Type{}
+	} else if typ == reflect.TypeOf(decimal.Decimal64(0)) {
+		physical = &arrow.Decimal64Type{}
+	} else if typ == reflect.TypeOf(decimal.Decimal128{}) {
+		physical = &arrow.Decimal128Type{}
+	} else if typ == reflect.TypeOf(decimal.Decimal256{}) {
+		physical = &arrow.Decimal256Type{}
+	}
+	// Special case for big.Int
+	if typ == reflect.TypeOf(big.Int{}) {
+		if precision == nil {
+			p := int32(decimal.MaxPrecision[decimal.Decimal128]())
+			precision = &p
+		}
+		physical = &arrow.Decimal128Type{Precision: *precision, Scale: 0}
+	}
+
+	if physical != nil {
+		zeroint32 := int32(0)
+		// Ensure that the precision and scale are set for decimal types
+		if precision == nil {
+			switch physical.(type) {
+			case *arrow.Decimal32Type:
+				p := int32(decimal.MaxPrecision[decimal.Decimal32]())
+				precision = &p
+				scale = &zeroint32
+			case *arrow.Decimal64Type:
+				p := int32(decimal.MaxPrecision[decimal.Decimal64]())
+				precision = &p
+				scale = &zeroint32
+			case *arrow.Decimal128Type:
+				p := int32(decimal.MaxPrecision[decimal.Decimal128]())
+				precision = &p
+				scale = &zeroint32
+			case *arrow.Decimal256Type:
+				p := int32(decimal.MaxPrecision[decimal.Decimal256]())
+				precision = &p
+				scale = &zeroint32
+			}
+		}
+		switch physical.(type) {
+		case *arrow.Decimal32Type, *arrow.Decimal64Type, *arrow.Decimal128Type, *arrow.Decimal256Type:
+			if precision == nil {
+				panic("precision must be set for decimal type")
+			}
+			if scale == nil {
+				panic("scale must be set for decimal type")
+			}
+		}
+		switch physical.(type) {
+		case *arrow.Decimal32Type:
+			newTyp := arrow.Decimal32Type{Precision: *precision, Scale: *scale}
+			return true, &partialField{typ: &newTyp}
+		case *arrow.Decimal64Type:
+			newTyp := arrow.Decimal64Type{Precision: *precision, Scale: *scale}
+			return true, &partialField{typ: &newTyp}
+		case *arrow.Decimal128Type:
+			newTyp := arrow.Decimal128Type{Precision: *precision, Scale: *scale}
+			return true, &partialField{typ: &newTyp}
+		case *arrow.Decimal256Type:
+			newTyp := arrow.Decimal256Type{Precision: *precision, Scale: *scale}
+			return true, &partialField{typ: &newTyp}
+		}
+	}
+	return false, nil
+}
+
 // NewSchemaFromStruct generates a schema from an object type via reflection of
-// the type and reading struct tags for "parquet".
-//
-// # Rules
-//
-// Everything defaults to Required repetition, unless otherwise specified.
-// Pointer types become Optional repetition.
-// Arrays and Slices become logical List types unless using the tag `repetition=repeated`.
-//
-// A length specified byte field (like [5]byte) becomes a fixed_len_byte_array of that length
-// unless otherwise specified by tags.
-//
-// string and []byte both become ByteArray unless otherwise specified.
-//
-// Integer types will default to having a logical type of the appropriate bit width
-// and signedness rather than having no logical type, ie: an int8 will become an int32
-// node with logical type Int(bitWidth=8, signed=true).
-//
-// Structs will become group nodes with the fields of the struct as the fields of the group,
-// recursively creating the nodes.
-//
-// maps will become appropriate Map structures in the schema of the defined key and values.
-//
-// # Available Tags
-//
-// name: by default the node will have the same name as the field, this tag let's you specify a name
-//
-// type: Specify the physical type instead of using the field type
-//
-// length: specify the type length of the node, only relevant for fixed_len_byte_array
-//
-// scale: specify the scale for a decimal field
-//
-// precision: specify the precision for a decimal field
-//
-// fieldid: specify the field ID for that node, defaults to -1 which means it is not set in the parquet file.
-//
-// repetition: specify the repetition as something other than what is determined by the type
-//
-// converted: specify the Converted Type of the field
-//
-// logical: specify the logical type of the field, if using decimal then the scale and precision
-// will be determined by the precision and scale fields, or by the logical.precision / logical.scale fields
-// with the logical. prefixed versions taking precedence. For Time or Timestamp logical types,
-// use logical.unit=<millis|micros|nanos> and logical.isadjustedutc=<true|false> to set those. Unit is required
-// isadjustedutc defaults to true. For Integer logical type, use logical.bitwidth and logical.signed to specify
-// those values, with bitwidth being required, and signed defaulting to true.
-//
-// All tags other than name can use a prefix of "key<tagname>=<value>" to refer to the type of the key for a map
-// and "value<tagname>=<value>" to refer to the value type of a map or the element of a list (such as the type of a slice)
+// the type and reading struct tags for "arrow".
 func NewSchemaFromStruct(obj interface{}) (sc *arrow.Schema, err error) {
 	ot := reflect.TypeOf(obj)
 	if ot.Kind() == reflect.Ptr {
@@ -660,11 +659,13 @@ func NewSchemaFromStruct(obj interface{}) (sc *arrow.Schema, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			sc = nil
+			// print the current stack trace
+			debug.PrintStack()
 			err = utils.FormatRecoveredError("unknown panic", r)
 		}
 	}()
 
-	root := typeToNode(ot.Name(), ot, nil)
+	root := typeToPartialArrowField(ot.Name(), ot, nil)
 	switch root.typ.(type) {
 	case *arrow.StructType:
 		return arrow.NewSchema(root.typ.(*arrow.StructType).Fields(), nil), nil
@@ -673,213 +674,22 @@ func NewSchemaFromStruct(obj interface{}) (sc *arrow.Schema, err error) {
 	}
 }
 
-var parquetTypeToReflect = map[parquet.Type]reflect.Type{
-	parquet.Types.Boolean:           reflect.TypeOf(true),
-	parquet.Types.Int32:             reflect.TypeOf(int32(0)),
-	parquet.Types.Int64:             reflect.TypeOf(int64(0)),
-	parquet.Types.Float:             reflect.TypeOf(float32(0)),
-	parquet.Types.Double:            reflect.TypeOf(float64(0)),
-	parquet.Types.Int96:             reflect.TypeOf(parquet.Int96{}),
-	parquet.Types.ByteArray:         reflect.TypeOf(parquet.ByteArray{}),
-	parquet.Types.FixedLenByteArray: reflect.TypeOf(parquet.FixedLenByteArray{}),
-}
-
-// func typeFromNode(n Node) reflect.Type {
-// 	switch n.Type() {
-// 	case Primitive:
-// 		typ := parquetTypeToReflect[n.(*PrimitiveNode).PhysicalType()]
-// 		// if a bytearray field is annotated as a String logical type or a UTF8 converted type
-// 		// then use a string instead of parquet.ByteArray / parquet.FixedLenByteArray which are []byte
-// 		if n.LogicalType().Equals(StringLogicalType{}) || n.ConvertedType() == ConvertedTypes.UTF8 {
-// 			typ = reflect.TypeOf(string(""))
+// // NewStructFromSchema generates a struct type as a reflect.Type from the schema
+// // by using the appropriate physical types and making things either pointers or slices
+// // based on whether.
+// //
+// // It will use maps for map types and slices for list types.
+// func NewStructFromSchema(sc *arrow.Schema) (t reflect.Type, err error) {
+// 	defer func() {
+// 		if r := recover(); r != nil {
+// 			t = nil
+// 			err = utils.FormatRecoveredError("unknown panic", r)
 // 		}
+// 	}()
 
-// 		if n.RepetitionType() == parquet.Repetitions.Optional {
-// 			typ = reflect.PointerTo(typ)
-// 		} else if n.RepetitionType() == parquet.Repetitions.Repeated {
-// 			typ = reflect.SliceOf(typ)
-// 		}
-
-// 		return typ
-// 	case Group:
-// 		gnode := n.(*GroupNode)
-// 		switch gnode.ConvertedType() {
-// 		case ConvertedTypes.List:
-// 			// According to the Parquet Spec, a list should always be a 3-level structure
-// 			//
-// 			//	<list-repetition> group <name> (LIST) {
-// 			//		repeated group list {
-// 			//			<element-repetition> <element-type> element;
-// 			//		}
-// 			//	}
-// 			//
-// 			// Outer-most level must be a group annotated with LIST containing a single field named "list".
-// 			// this level must be only optional (if the list is nullable) or required
-// 			// Middle level, named list, must be repeated group with a single field named "element"
-// 			// "element" field is the lists element type and repetition, which should be only required or optional
-
-// 			if gnode.fields.Len() != 1 {
-// 				panic("invalid list node, should have exactly 1 child.")
-// 			}
-
-// 			if gnode.fields[0].RepetitionType() != parquet.Repetitions.Repeated {
-// 				panic("invalid list node, child should be repeated")
-// 			}
-
-// 			// it is required that the repeated group of elements is named "list" and it's element
-// 			// field is named "element", however existing data may not use this so readers shouldn't
-// 			// enforce them as errors
-// 			//
-// 			// Rules for backward compatibility from the parquet spec:
-// 			//
-// 			// 1) if the repeated field is not a group, then it's type is the element type and elements
-// 			//    must be required.
-// 			// 2) if the repeated field is a group with multiple fields, then its type is the element type
-// 			//    and elements must be required.
-// 			// 3) if the repeated field is a group with one field AND is named either "array" or uses the
-// 			//    LIST-annotated group's name with "_tuple" suffix, then the repeated type is the element
-// 			//    type and the elements must be required.
-// 			// 4) otherwise, the repeated field's type is the element type with the repeated field's repetition
-
-// 			elemMustBeRequired := false
-// 			addSlice := false
-// 			var elemType reflect.Type
-// 			elemNode := gnode.fields[0]
-// 			switch {
-// 			case elemNode.Type() == Primitive,
-// 				elemNode.(*GroupNode).fields.Len() > 1,
-// 				elemNode.(*GroupNode).fields.Len() == 1 && (elemNode.Name() == "array" || elemNode.Name() == gnode.Name()+"_tuple"):
-// 				elemMustBeRequired = true
-// 				elemType = typeFromNode(elemNode)
-// 			default:
-// 				addSlice = true
-// 				elemType = typeFromNode(elemNode.(*GroupNode).fields[0])
-// 			}
-
-// 			if elemMustBeRequired && elemType.Kind() == reflect.Ptr {
-// 				elemType = elemType.Elem()
-// 			}
-// 			if addSlice {
-// 				elemType = reflect.SliceOf(elemType)
-// 			}
-// 			if gnode.RepetitionType() == parquet.Repetitions.Optional {
-// 				elemType = reflect.PointerTo(elemType)
-// 			}
-// 			return elemType
-// 		case ConvertedTypes.Map, ConvertedTypes.MapKeyValue:
-// 			// According to the Parquet Spec, the outer-most level should be
-// 			// a group containing a single field named "key_value" with repetition
-// 			// either optional or required for whether or not the map is nullable.
-// 			//
-// 			// The key_value middle level *must* be a repeated group with a "key" field
-// 			// and *optionally* a "value" field
-// 			//
-// 			// the "key" field *must* be required and must always exist
-// 			//
-// 			// the "value" field can be required or optional or omitted.
-// 			//
-// 			// 	<map-repetition> group <name> (MAP) {
-// 			//		repeated group key_value {
-// 			//			required <key-type> key;
-// 			//			<value-repetition> <value-type> value;
-// 			//		}
-// 			//	}
-
-// 			if gnode.fields.Len() != 1 {
-// 				panic("invalid map node, should have exactly 1 child")
-// 			}
-
-// 			if gnode.fields[0].Type() != Group {
-// 				panic("invalid map node, child should be a group node")
-// 			}
-
-// 			// that said, this may not be used in existing data and should not be
-// 			// enforced as errors when reading.
-// 			//
-// 			// some data may also incorrectly use MAP_KEY_VALUE instead of MAP
-// 			//
-// 			// so any group with MAP_KEY_VALUE that is not contained inside of a "MAP"
-// 			// group, should be considered equivalent to being a MAP group itself.
-// 			//
-// 			// in addition, the fields may not be called "key" and "value" in existing
-// 			// data, and as such should not be enforced as errors when reading.
-
-// 			keyval := gnode.fields[0].(*GroupNode)
-
-// 			keyIndex := keyval.FieldIndexByName("key")
-// 			if keyIndex == -1 {
-// 				keyIndex = 0 // use first child if there is no child named "key"
-// 			}
-
-// 			keyType := typeFromNode(keyval.fields[keyIndex])
-// 			if keyType.Kind() == reflect.Ptr {
-// 				keyType = keyType.Elem()
-// 			}
-// 			// can't use a []byte as a key for a map, so use string
-// 			if keyType == reflect.TypeOf(parquet.ByteArray{}) || keyType == reflect.TypeOf(parquet.FixedLenByteArray{}) {
-// 				keyType = reflect.TypeOf(string(""))
-// 			}
-
-// 			// if the value node is omitted, then consider this a "set" and make it a
-// 			// map[key-type]bool
-// 			valType := reflect.TypeOf(true)
-// 			if keyval.fields.Len() > 1 {
-// 				valIndex := keyval.FieldIndexByName("value")
-// 				if valIndex == -1 {
-// 					valIndex = 1 // use second child if there is no child named "value"
-// 				}
-
-// 				valType = typeFromNode(keyval.fields[valIndex])
-// 			}
-
-// 			mapType := reflect.MapOf(keyType, valType)
-// 			if gnode.RepetitionType() == parquet.Repetitions.Optional {
-// 				mapType = reflect.PointerTo(mapType)
-// 			}
-// 			return mapType
-// 		default:
-// 			fields := []reflect.StructField{}
-// 			for _, f := range gnode.fields {
-// 				fields = append(fields, reflect.StructField{
-// 					Name:    f.Name(),
-// 					Type:    typeFromNode(f),
-// 					PkgPath: "parquet",
-// 				})
-// 			}
-
-// 			structType := reflect.StructOf(fields)
-// 			if gnode.RepetitionType() == parquet.Repetitions.Repeated {
-// 				return reflect.SliceOf(structType)
-// 			}
-// 			if gnode.RepetitionType() == parquet.Repetitions.Optional {
-// 				return reflect.PointerTo(structType)
-// 			}
-// 			return structType
-// 		}
+// 	// t = typeFromNode(sc.root)
+// 	if t.Kind() == reflect.Slice || t.Kind() == reflect.Ptr {
+// 		return t.Elem(), nil
 // 	}
-// 	panic("what happened?")
+// 	return
 // }
-
-// NewStructFromSchema generates a struct type as a reflect.Type from the schema
-// by using the appropriate physical types and making things either pointers or slices
-// based on whether they are repeated/optional/required. It does not use the logical
-// or converted types to change the physical storage so that it is more efficient to use
-// the resulting type for reading without having to do conversions.
-//
-// It will use maps for map types and slices for list types, but otherwise ignores the
-// converted and logical types of the nodes. Group nodes that are not List or Map will
-// be nested structs.
-func NewStructFromSchema(sc *arrow.Schema) (t reflect.Type, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			t = nil
-			err = utils.FormatRecoveredError("unknown panic", r)
-		}
-	}()
-
-	// t = typeFromNode(sc.root)
-	if t.Kind() == reflect.Slice || t.Kind() == reflect.Ptr {
-		return t.Elem(), nil
-	}
-	return
-}
